@@ -4,7 +4,7 @@ Since the end of October 2026, the Hibernate 7 Db2 tests of [apache/grails-core]
 
 The workflow in this repository finds out where the connection fails. Each of its 20 probe jobs records:
 
-- the region of the runner and its public IPv4 address,
+- the region of the runner, and the cloud for an Azure one (some `ubuntu-24.04` runners now run in AWS regions such as `us-west-2`), and its public IPv4 address,
 - the addresses `icr.io` resolves to,
 - whether `https://icr.io/v2/` answers, and how long each phase takes, with `us.icr.io`, Docker Hub, `ghcr.io` and `quay.io` for comparison,
 - whether each `icr.io` address answers on its own,

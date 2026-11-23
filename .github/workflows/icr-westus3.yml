@@ -135,13 +135,17 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
                 --jq '.jobs[] | select(.name | startswith("Probe ")) | "\(.id) \(.name)"' | sort -k3 -n |
             while read -r id _ n; do
-              region=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${id}/logs" 2> /dev/null | grep -m1 -oE 'Region: [a-z0-9]+' | cut -d' ' -f2)
+              log=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${id}/logs" 2> /dev/null)
+              # Azure regions have no hyphen (westus3), AWS regions do (us-west-2); only Azure adds a Cloud line
+              region=$(grep -m1 -oE 'Region: [a-z0-9-]+' <<< "${log}" | cut -d' ' -f2)
+              cloud=$(grep -m1 -oE 'Cloud: [A-Za-z]+' <<< "${log}" | cut -d' ' -f2)
+              region="${region:-?} (${cloud:-no cloud named})"
               file="probe-${n}.txt"
               icr=$(grep -m1 '^icr.io http=' "${file}" | grep -oE 'http=[0-9]+|total=[0-9.]+s' | tr '\n' ' ')
               answered=$(grep -c '^address .* http=[1-5]' "${file}")
               addresses=$(grep -c '^address ' "${file}")
               pull=$(grep -m1 '^pull: ' "${file}" | cut -c7- | cut -c1-100)
               hub=$(grep -m1 '^registry-1.docker.io http=' "${file}" | grep -oE 'http=[0-9]+')
-              echo "| ${n} | ${region:-?} | ${icr:-?} | ${answered} of ${addresses} | ${pull:-?} | ${hub:-?} |"
+              echo "| ${n} | ${region} | ${icr:-?} | ${answered} of ${addresses} | ${pull:-?} | ${hub:-?} |"
             done
           } >> "${GITHUB_STEP_SUMMARY}"
