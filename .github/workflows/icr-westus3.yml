@@ -1,0 +1,147 @@
+# Finds out why the Docker daemon of some GitHub-hosted runners cannot reach IBM's registry, icr.io, from which the
+# Hibernate 7 Db2 rows of apache/grails-core pull icr.io/db2_community/db2:11.5.9.0. Every job that has failed on that
+# pull ran in the Azure region westus3, where the daemon got Docker's 500 "request canceled while waiting for connection
+# (Client.Timeout exceeded while awaiting headers)" or "context deadline exceeded" for https://icr.io/v2/ on every
+# attempt.
+#
+# Each probe job records the region, the addresses icr.io resolves to, whether each of them answers HTTPS, the route
+# to icr.io, and whether the Docker CLI and the Docker daemon get the image, with other registries for comparison. The
+# summary job puts one row per probe in the run summary. About a third of the jobs have landed in westus3 so far, so
+# 20 probes should catch several; rerun the workflow for more.
+
+name: icr.io from GitHub-hosted runners
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: "Probe ${{ matrix.n }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 ]
+    steps:
+      - name: "Probe icr.io and other registries"
+        shell: bash
+        run: |
+          # GitHub runs bash with -e, but a failing command is what this step records
+          set +e -u
+          image='icr.io/db2_community/db2:11.5.9.0'
+
+          # One line per host: the HTTP status (401 or 200 means the registry answered, 000 that it did not), the
+          # address, the time of each phase, and curl's error if there was one
+          https() {
+            local host=$1
+            shift
+            local result
+            result=$(curl -4 -sS -o /dev/null --max-time 20 \
+                -w 'http=%{http_code} ip=%{remote_ip} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s first_byte=%{time_starttransfer}s total=%{time_total}s' \
+                "$@" "https://${host}/v2/" 2> curl.err)
+            echo "${host} ${result} $(tr '\n' ' ' < curl.err)"
+          }
+
+          {
+            echo "== probe ${{ matrix.n }}"
+            echo "imds-location: $(curl -s --max-time 3 --noproxy '*' -H Metadata:true \
+                'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text' || echo unavailable)"
+            echo "public-ipv4: $(curl -s --max-time 10 https://api.ipify.org || echo unavailable)"
+
+            echo "== DNS"
+            getent ahostsv4 icr.io | awk '{ print "icr.io A " $1 }' | sort -u
+            # Without an AAAA record, getent gives the IPv4 address in IPv6 notation (::ffff:...), which is left out
+            getent ahostsv6 icr.io | awk '$1 !~ /^::ffff:/ { print "icr.io AAAA " $1 }' | sort -u
+            if command -v dig > /dev/null; then
+              dig +noall +answer icr.io A icr.io AAAA
+            fi
+
+            echo "== HTTPS /v2/"
+            for host in icr.io us.icr.io registry-1.docker.io ghcr.io quay.io; do
+              https "${host}"
+            done
+
+            echo "== icr.io, each address on its own"
+            for ip in $(getent ahostsv4 icr.io | awk '{ print $1 }' | sort -u); do
+              echo "address ${ip}: $(https icr.io --resolve "icr.io:443:${ip}")"
+            done
+
+            echo "== route to icr.io"
+            if command -v tracepath > /dev/null; then
+              timeout 60 tracepath -n -m 25 icr.io 2>&1 | tail -n 30
+            else
+              echo "tracepath is not installed"
+            fi
+
+            echo "== docker manifest inspect, the CLI's own HTTP client"
+            if timeout 60 docker manifest inspect "${image}" > /dev/null 2> manifest.err; then
+              echo "manifest: ok"
+            else
+              echo "manifest: failed: $(tr '\n' ' ' < manifest.err | cut -c1-500)"
+            fi
+
+            echo "== docker pull, through the daemon as Testcontainers pulls, stopped after 60 s"
+            start=$(date +%s)
+            timeout 60 docker pull "${image}" > pull.log 2>&1
+            status=$?
+            if [[ ${status} == 0 ]]; then
+              outcome=pulled
+            elif [[ ${status} == 124 ]]; then
+              outcome='still downloading when stopped'
+            else
+              outcome="failed: $(tail -n 1 pull.log | cut -c1-300)"
+            fi
+            echo "pull: $(( $(date +%s) - start )) s, ${outcome}"
+            head -n 5 pull.log
+          } 2>&1 | tee "probe-${{ matrix.n }}.txt"
+
+      - name: "Keep the result"
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: "probe-${{ matrix.n }}"
+          path: "probe-${{ matrix.n }}.txt"
+
+  summary:
+    name: "Summary"
+    needs: probe
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: probe-*
+          merge-multiple: true
+
+      - name: "One row per probe"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A grep that finds nothing is a count of 0, not a failure
+          set +e -u
+          # The region is the one the runner names in the header of its job log
+          {
+            echo '| Probe | Region | icr.io /v2/ | icr.io addresses that answered | docker pull | Docker Hub /v2/ |'
+            echo '|---|---|---|---|---|---|'
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+                --jq '.jobs[] | select(.name | startswith("Probe ")) | "\(.id) \(.name)"' | sort -k3 -n |
+            while read -r id _ n; do
+              region=$(gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${id}/logs" 2> /dev/null | grep -m1 -oE 'Region: [a-z0-9]+' | cut -d' ' -f2)
+              file="probe-${n}.txt"
+              icr=$(grep -m1 '^icr.io http=' "${file}" | grep -oE 'http=[0-9]+|total=[0-9.]+s' | tr '\n' ' ')
+              answered=$(grep -c '^address .* http=[1-5]' "${file}")
+              addresses=$(grep -c '^address ' "${file}")
+              pull=$(grep -m1 '^pull: ' "${file}" | cut -c7- | cut -c1-100)
+              hub=$(grep -m1 '^registry-1.docker.io http=' "${file}" | grep -oE 'http=[0-9]+')
+              echo "| ${n} | ${region:-?} | ${icr:-?} | ${answered} of ${addresses} | ${pull:-?} | ${hub:-?} |"
+            done
+          } >> "${GITHUB_STEP_SUMMARY}"
